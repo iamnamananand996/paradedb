@@ -599,11 +599,13 @@ impl MppSender {
         }
     }
 
-    /// Spin-loop helper: call `check_for_interrupts`. Gated out of test builds because the
-    /// pgrx macro pulls in symbols the lib-test binary doesn't link.
+    /// Spin-loop helper: poll for a pending cancel/die and bail with an error instead of
+    /// servicing it here. Servicing a die inside `block_on` would `proc_exit` out of the live
+    /// runtime; see `mpp::interrupt`.
     async fn spin_check_for_interrupts(&self) -> Result<(), DataFusionError> {
-        #[cfg(not(test))]
-        pgrx::check_for_interrupts!();
+        if crate::postgres::customscan::mpp::interrupt::cancel_pending() {
+            return Err(crate::postgres::customscan::mpp::interrupt::interrupted());
+        }
         Ok(())
     }
 

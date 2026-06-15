@@ -1708,7 +1708,18 @@ impl AggregateScan {
             let runtime = df_state.runtime.as_ref().unwrap();
             let stream = df_state.stream.as_mut().unwrap();
 
-            let next = runtime.block_on(async { stream.next().await });
+            let next = {
+                // Hold cancel/die off across the pull so a subroutine's `CHECK_FOR_INTERRUPTS`
+                // can't `proc_exit` out of the live runtime; the consumer drain polls
+                // cooperatively to bail. Resumes at end of block.
+                let _held = crate::postgres::customscan::mpp::interrupt::HeldInterrupts::hold();
+                runtime.block_on(async { stream.next().await })
+            };
+
+            // The consumer drain bails cooperatively on a pending cancel/die so the runtime
+            // can unwind first; service it now with the runtime idle (a die `proc_exit`s here)
+            // before the error match below.
+            crate::postgres::customscan::mpp::interrupt::process_pending();
 
             match next {
                 Some(Ok(batch)) => {

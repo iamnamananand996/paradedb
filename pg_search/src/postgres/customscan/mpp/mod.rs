@@ -31,6 +31,7 @@ pub mod dsm_mpsc_ring;
 pub mod exec_worker;
 pub mod glue;
 pub mod host;
+pub mod interrupt;
 pub mod mesh;
 pub mod runtime;
 pub mod task_estimator;
