@@ -221,6 +221,7 @@ impl MVCCDirectory {
                             &meta,
                             heap_fetch_state,
                             expression_state,
+                            self.mvcc_style.as_ref(),
                         )
                         .expect("Failed to index mutable segment.")
                     })
@@ -607,6 +608,7 @@ pub fn index_memory_segment(
     segment: &SegmentMetaEntry,
     heap_fetch_state: &HeapFetchState,
     expression_state: &ExpressionState,
+    mvcc_style: &MvccSatisfies,
 ) -> anyhow::Result<RamDirectory> {
     use crate::index::writer::index::SerialIndexWriter;
     use crate::postgres::utils::{row_to_search_document, u64_to_item_pointer};
@@ -680,6 +682,10 @@ pub fn index_memory_segment(
 
     let mut values = vec![pg_sys::Datum::null(); heaptupdesc.len()];
     let mut isnull = vec![false; heaptupdesc.len()];
+    let use_active_snapshot = matches!(
+        mvcc_style,
+        MvccSatisfies::Snapshot | MvccSatisfies::LargestSegment | MvccSatisfies::ParallelWorker(_)
+    );
 
     'next_ctid: for ctid in ctids {
         // Guard against stale ctids referencing heap blocks truncated by VACUUM.
@@ -700,20 +706,20 @@ pub fn index_memory_segment(
         u64_to_item_pointer(ctid, &mut ipd);
 
         unsafe {
-            // NOTE: We fetch using SnapshotAny, and then filter out tuples that are not visible
-            // to any transaction using `HeapTupleSatisfiesVacuum`. This allows us to load and
-            // merge mutable segments even before all of their data is necessarily visible in the
-            // current transaction, but excludes tuples that are fully "dead".
-            //
-            // TODO: We could potentially actually apply the MvccSatisfies setting here, which
-            // would avoid a small amount of indexing for MvccSatisfies::Snapshot (any future
-            // txns, essentially).
+            // Query-visible materialization must choose the heap tuple with the same snapshot
+            // `pg_detoast_datum` will use for TOAST chunks. Otherwise SnapshotAny can hand us
+            // an old heap tuple whose external TOAST rows are not visible to the active snapshot.
             let mut call_again = false;
             'next_hot_chain: loop {
+                let snapshot = if use_active_snapshot {
+                    pg_sys::GetActiveSnapshot()
+                } else {
+                    &raw mut pg_sys::SnapshotAnyData
+                };
                 let fetched = pg_sys::table_index_fetch_tuple(
                     heap_fetch_state.scan,
                     &mut ipd,
-                    &raw mut pg_sys::SnapshotAnyData,
+                    snapshot,
                     heap_fetch_state.slot(),
                     // call_again: This parameter will be set to true if this `ctid` points to multiple
                     // tuples as part of a HOT chain. We must attempt to find one live version of the
@@ -726,14 +732,21 @@ pub fn index_memory_segment(
                 );
 
                 if !fetched {
-                    // Due to heap page pruning, some tuples might no longer exist (regardless of our
-                    // SnapshotAny setting), so we can skip indexing their content.
+                    // The tuple either no longer exists, or is not visible to the snapshot used for
+                    // this materialization mode. Keep the ctid tombstone without indexing content.
                     writer.insert(tantivy::TantivyDocument::new(), ctid, || {
                         unreachable!("No limits configured: should not finalize.")
                     })?;
                     continue 'next_ctid;
                 }
 
+                if use_active_snapshot {
+                    break;
+                }
+
+                // Merge/vacuum materialization can still use SnapshotAny so it can see tuples that
+                // are not yet query-visible in this transaction. Filter out old tuple versions that
+                // are unsafe to detoast under the active snapshot.
                 let mut htsv_result = {
                     let buffer = (*heap_fetch_state.buffer_slot()).buffer;
                     let _lock = BorrowedBuffer::from_pg(buffer);
@@ -745,16 +758,8 @@ pub fn index_memory_segment(
                 };
 
                 if htsv_result == HTSV_Result::HEAPTUPLE_RECENTLY_DEAD {
-                    // Our `oldest_xmin` might be stale compared to a concurrent VACUUM.
-                    // If VACUUM saw this tuple as DEAD and deleted its TOAST chunks, we
-                    // must also see it as DEAD, otherwise we'll crash trying to read them.
-                    //
-                    // A single re-check is sufficient (no loop needed) because
-                    // `GetOldestNonRemovableTransactionId` returns the current global
-                    // XID horizon. If the tuple is still RECENTLY_DEAD under this fresh
-                    // horizon, then no concurrent VACUUM could have considered it DEAD
-                    // (VACUUM uses the same or an older horizon), so its TOAST data is
-                    // guaranteed to still exist.
+                    // Our `oldest_xmin` might be stale compared to a concurrent VACUUM, so
+                    // refresh once before deciding whether this version is still usable.
                     let fresh_oldest_xmin =
                         pg_sys::GetOldestNonRemovableTransactionId(heaprel.as_ptr());
                     if fresh_oldest_xmin != oldest_xmin {
@@ -768,16 +773,17 @@ pub fn index_memory_segment(
                     }
                 }
 
-                if htsv_result == HTSV_Result::HEAPTUPLE_DEAD {
-                    // This copy of the tuple is no longer visible to any transaction. Are there
-                    // more in the HOT chain?
+                if matches!(
+                    htsv_result,
+                    HTSV_Result::HEAPTUPLE_DEAD | HTSV_Result::HEAPTUPLE_RECENTLY_DEAD
+                ) {
+                    // This copy of the tuple is not safe to index. DEAD tuples may already have
+                    // lost their TOAST chunks, and RECENTLY_DEAD tuples can be invisible to the
+                    // active snapshot used by TOAST lookup.
                     if call_again {
-                        // There are more entries in the hot chain: find the first one that is
-                        // visible.
+                        // There are more entries in the hot chain: find the first usable version.
                         continue 'next_hot_chain;
                     } else {
-                        // There are no more entries in the HOT chain, so no copy of the tuple is
-                        // visible in any transaction.
                         writer.insert(tantivy::TantivyDocument::new(), ctid, || {
                             unreachable!("No limits configured: should not finalize.")
                         })?;
