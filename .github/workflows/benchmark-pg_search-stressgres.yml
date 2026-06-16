@@ -260,6 +260,7 @@ jobs:
 
       # Runs default to 10 minutes, but can be configured to run for longer with the `duration` input.
       - name: Benchmark single-server.toml
+        if: false
         uses: ./.github/actions/benchmark-stressgres
         with:
           test_file: single-server.toml
@@ -271,6 +272,7 @@ jobs:
           pr_label: ${{ steps.pr_label.outputs.result }}
 
       - name: Benchmark bulk-updates.toml
+        if: false
         uses: ./.github/actions/benchmark-stressgres
         with:
           test_file: bulk-updates.toml
@@ -282,6 +284,7 @@ jobs:
           pr_label: ${{ steps.pr_label.outputs.result }}
 
       - name: Benchmark wide-table.toml
+        if: false
         uses: ./.github/actions/benchmark-stressgres
         with:
           test_file: wide-table.toml
@@ -293,6 +296,7 @@ jobs:
           pr_label: ${{ steps.pr_label.outputs.result }}
 
       - name: Benchmark background-merge.toml
+        if: false
         uses: ./.github/actions/benchmark-stressgres
         with:
           test_file: background-merge.toml
@@ -304,6 +308,7 @@ jobs:
           pr_label: ${{ steps.pr_label.outputs.result }}
 
       - name: Benchmark logical-replication.toml
+        if: false
         uses: ./.github/actions/benchmark-stressgres
         with:
           test_file: logical-replication.toml
@@ -314,17 +319,16 @@ jobs:
           slack_channel: ${{ secrets.SLACK_BENCHMARKS_CHANNEL_ID }}
           pr_label: ${{ steps.pr_label.outputs.result }}
 
-      # Disabled pending https://github.com/paradedb/paradedb/issues/5076
-      # - name: Benchmark logical-replication-merge.toml
-      #   uses: ./.github/actions/benchmark-stressgres
-      #   with:
-      #     test_file: logical-replication-merge.toml
-      #     ref: ${{ steps.determine-ref.outputs.ref || steps.commit_info.outputs.short_commit }}
-      #     github_app_id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
-      #     github_app_private_key: ${{ secrets.PARADEDB_GITHUB_APP_PRIVATE_KEY }}
-      #     slack_oauth_token: ${{ secrets.SLACK_OAUTH_TOKEN }}
-      #     slack_channel: ${{ secrets.SLACK_BENCHMARKS_CHANNEL_ID }}
-      #     pr_label: ${{ steps.pr_label.outputs.result }}
+      - name: Benchmark logical-replication-merge.toml
+        uses: ./.github/actions/benchmark-stressgres
+        with:
+          test_file: logical-replication-merge.toml
+          ref: ${{ steps.determine-ref.outputs.ref || steps.commit_info.outputs.short_commit }}
+          github_app_id: ${{ vars.PARADEDB_GITHUB_APP_CLIENT_ID }}
+          github_app_private_key: ${{ secrets.PARADEDB_GITHUB_APP_PRIVATE_KEY }}
+          slack_oauth_token: ${{ secrets.SLACK_OAUTH_TOKEN }}
+          slack_channel: ${{ secrets.SLACK_BENCHMARKS_CHANNEL_ID }}
+          pr_label: ${{ steps.pr_label.outputs.result }}
 
       - name: Notify Slack on Failure (push only)
         if: failure() && github.event_name == 'push'
