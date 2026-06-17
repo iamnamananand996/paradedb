@@ -46,9 +46,9 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label.name == 'benchmark') || (github.event_name == 'pull_request' && github.event.label.name == 'benchmark-stressgres')
     env:
       pg_version: 18
-      PG_SEARCH_TOAST_DIAG_LOG_LIMIT: 300
-      PG_SEARCH_TOAST_DIAG_DELAY_US: 2000000
-      PG_SEARCH_TOAST_DIAG_DELAY_LIMIT: 10
+      PG_SEARCH_TOAST_DIAG_LOG_LIMIT: 600
+      PG_SEARCH_TOAST_DIAG_DELAY_US: 10000000
+      PG_SEARCH_TOAST_DIAG_DELAY_LIMIT: 3
       PG_SEARCH_TOAST_DIAG_FORCE_UNPROTECTED: "1"
 
     steps:

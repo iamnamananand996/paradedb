@@ -16,7 +16,10 @@ CREATE TABLE test (
     message TEXT,
     old_message TEXT,
     unique_id BIGINT UNIQUE
-) WITH (autovacuum_enabled = false);
+) WITH (autovacuum_enabled = false, toast_tuple_target = 128);
+
+ALTER TABLE test ALTER COLUMN message SET STORAGE EXTERNAL;
+ALTER TABLE test ALTER COLUMN old_message SET STORAGE EXTERNAL;
 
 DROP SEQUENCE IF EXISTS test_unique_id_seq;
 CREATE SEQUENCE test_unique_id_seq START 1;
@@ -28,7 +31,8 @@ INSERT INTO test (message, unique_id)
 SELECT
     (ARRAY['beer wine cheese', 'beer wine', 'beer cheese', 'beer',
            'wine cheese', 'wine', 'cheese', 'bread butter'])[1 + (i % 8)]
-    || ' ' || i::text,
+    || ' seed ' || i::text || ' ' ||
+    (SELECT string_agg(md5(i::text || ':' || n::text), '') FROM generate_series(1, 512) AS g(n)),
     nextval('test_unique_id_seq')
 FROM generate_series(1, 100) AS s(i);
 """
@@ -65,7 +69,17 @@ CREATE TABLE test (
     autovacuum_enabled = true,
     autovacuum_vacuum_scale_factor = 0,
     autovacuum_vacuum_threshold = 50,
-    autovacuum_vacuum_insert_threshold = 50
+    autovacuum_vacuum_insert_threshold = 50,
+    toast_tuple_target = 128
+);
+
+ALTER TABLE test ALTER COLUMN message SET STORAGE EXTERNAL;
+ALTER TABLE test ALTER COLUMN old_message SET STORAGE EXTERNAL;
+ALTER TABLE test SET (
+    toast.autovacuum_enabled = true,
+    toast.autovacuum_vacuum_scale_factor = 0,
+    toast.autovacuum_vacuum_threshold = 0,
+    toast.autovacuum_vacuum_insert_threshold = 0
 );
 
 DROP SUBSCRIPTION IF EXISTS stressgres_sub;
@@ -105,6 +119,15 @@ SELECT count(*) FILTER (WHERE visible)         AS visible,
        pg_relation_size('idxtest')             AS relation_size,
        pg_size_pretty(pg_relation_size('idxtest'))
 FROM paradedb.index_info('idxtest', true);
+"""
+destinations = ["Subscriber"]
+
+[[jobs]]
+refresh_ms = 10
+log_tps = false
+title = "Subscriber Vacuum"
+sql = """
+VACUUM (INDEX_CLEANUP ON) test;
 """
 destinations = ["Subscriber"]
 
@@ -165,7 +188,12 @@ refresh_ms = 50
 log_tps = false
 title = "Update 1..50"
 sql = """
-UPDATE test SET message = message || ' ' || txid_current(), old_message = message WHERE id <= 50;
+UPDATE test
+SET
+  old_message = message,
+  message = 'beer wine cheese update ' || id::text || ' ' || txid_current()::text || ' ' ||
+            (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 512))
+WHERE id <= 50;
 """
 destinations = ["Publisher"]
 
@@ -174,7 +202,12 @@ refresh_ms = 50
 log_tps = false
 title = "Update 51..100"
 sql = """
-UPDATE test SET message = message || ' ' || txid_current(), old_message = message WHERE id > 50 AND id <= 100;
+UPDATE test
+SET
+  old_message = message,
+  message = 'wine cheese bread update ' || id::text || ' ' || txid_current()::text || ' ' ||
+            (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 512))
+WHERE id > 50 AND id <= 100;
 """
 destinations = ["Publisher"]
 
@@ -183,7 +216,12 @@ refresh_ms = 75
 log_tps = false
 title = "Insert value"
 sql = """
-INSERT INTO test (message, unique_id) VALUES ('new ' || txid_current(), nextval('test_unique_id_seq'));
+INSERT INTO test (message, unique_id)
+VALUES (
+  'new beer wine cheese bread ' || txid_current()::text || ' ' ||
+  (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 512)),
+  nextval('test_unique_id_seq')
+);
 """
 destinations = ["Publisher"]
 
