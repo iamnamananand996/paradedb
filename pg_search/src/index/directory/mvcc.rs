@@ -613,10 +613,21 @@ pub fn index_memory_segment(
     use pgrx::{
         pg_sys::{
             heap_deform_tuple, GetOldestNonRemovableTransactionId, HTSV_Result,
-            HeapTupleSatisfiesVacuum,
+            HeapTupleSatisfiesVacuum, HeapTupleSatisfiesVisibility,
         },
         PgTupleDesc,
     };
+
+    fn htsv_result_name(htsv_result: pg_sys::HTSV_Result::Type) -> &'static str {
+        match htsv_result {
+            HTSV_Result::HEAPTUPLE_DEAD => "DEAD",
+            HTSV_Result::HEAPTUPLE_LIVE => "LIVE",
+            HTSV_Result::HEAPTUPLE_RECENTLY_DEAD => "RECENTLY_DEAD",
+            HTSV_Result::HEAPTUPLE_INSERT_IN_PROGRESS => "INSERT_IN_PROGRESS",
+            HTSV_Result::HEAPTUPLE_DELETE_IN_PROGRESS => "DELETE_IN_PROGRESS",
+            _ => "UNKNOWN",
+        }
+    }
 
     /// RAII guard that guarantees an active snapshot for the duration of the heap reads and
     /// detoasting performed while materializing a mutable segment.
@@ -709,7 +720,16 @@ pub fn index_memory_segment(
             // would avoid a small amount of indexing for MvccSatisfies::Snapshot (any future
             // txns, essentially).
             let mut call_again = false;
-            'next_hot_chain: loop {
+            let (
+                tuple_htsv_result,
+                tuple_active_visible,
+                tuple_blockno,
+                tuple_offno,
+                tuple_xmin,
+                tuple_xmax,
+                tuple_infomask,
+                tuple_infomask2,
+            ) = 'next_hot_chain: loop {
                 let fetched = pg_sys::table_index_fetch_tuple(
                     heap_fetch_state.scan,
                     &mut ipd,
@@ -768,6 +788,51 @@ pub fn index_memory_segment(
                     }
                 }
 
+                let (
+                    tuple_htsv_result,
+                    tuple_active_visible,
+                    tuple_blockno,
+                    tuple_offno,
+                    tuple_xmin,
+                    tuple_xmax,
+                    tuple_infomask,
+                    tuple_infomask2,
+                ) = {
+                    let buffer = (*heap_fetch_state.buffer_slot()).buffer;
+                    let tuple = (*heap_fetch_state.buffer_slot()).base.tuple;
+                    let _lock = BorrowedBuffer::from_pg(buffer);
+                    (
+                        htsv_result,
+                        HeapTupleSatisfiesVisibility(tuple, pg_sys::GetActiveSnapshot(), buffer),
+                        pg_sys::ItemPointerGetBlockNumber(&(*tuple).t_self),
+                        pg_sys::ItemPointerGetOffsetNumber(&(*tuple).t_self),
+                        (*(*tuple).t_data).t_choice.t_heap.t_xmin.into_inner(),
+                        (*(*tuple).t_data).t_choice.t_heap.t_xmax.into_inner(),
+                        (*(*tuple).t_data).t_infomask,
+                        (*(*tuple).t_data).t_infomask2,
+                    )
+                };
+
+                if !tuple_active_visible || htsv_result != HTSV_Result::HEAPTUPLE_LIVE {
+                    pgrx::warning!(
+                        "pg_search toast diagnostic: SnapshotAny selected heap tuple before detoast index={} index_oid={} heap={} heap_oid={} segment={:?} requested_ctid={} tuple_ctid=({}, {}) htsv={} active_visible={} xmin={} xmax={} infomask=0x{:x} infomask2=0x{:x}",
+                        indexrel.name(),
+                        indexrel.oid(),
+                        heaprel.name(),
+                        heaprel.oid(),
+                        segment_meta.id(),
+                        ctid,
+                        tuple_blockno,
+                        tuple_offno,
+                        htsv_result_name(htsv_result),
+                        tuple_active_visible,
+                        tuple_xmin,
+                        tuple_xmax,
+                        tuple_infomask,
+                        tuple_infomask2,
+                    );
+                }
+
                 if htsv_result == HTSV_Result::HEAPTUPLE_DEAD {
                     // This copy of the tuple is no longer visible to any transaction. Are there
                     // more in the HOT chain?
@@ -786,8 +851,17 @@ pub fn index_memory_segment(
                 }
 
                 // We successfully fetched a tuple. Break out to fetch and deform it.
-                break;
-            }
+                break (
+                    tuple_htsv_result,
+                    tuple_active_visible,
+                    tuple_blockno,
+                    tuple_offno,
+                    tuple_xmin,
+                    tuple_xmax,
+                    tuple_infomask,
+                    tuple_infomask2,
+                );
+            };
 
             // We have a completely valid tuple to index: fetch and deform it.
             //
@@ -818,6 +892,28 @@ pub fn index_memory_segment(
                 if !isnull[i] {
                     let att = heaptupdesc.get(i).expect("valid attribute");
                     if att.attlen == -1 {
+                        if !tuple_active_visible || tuple_htsv_result != HTSV_Result::HEAPTUPLE_LIVE
+                        {
+                            pgrx::warning!(
+                                "pg_search toast diagnostic: about to detoast varlena index={} index_oid={} heap={} heap_oid={} segment={:?} requested_ctid={} tuple_ctid=({}, {}) attno={} attname={} htsv={} active_visible={} xmin={} xmax={} infomask=0x{:x} infomask2=0x{:x}",
+                                indexrel.name(),
+                                indexrel.oid(),
+                                heaprel.name(),
+                                heaprel.oid(),
+                                segment_meta.id(),
+                                ctid,
+                                tuple_blockno,
+                                tuple_offno,
+                                i + 1,
+                                att.name(),
+                                htsv_result_name(tuple_htsv_result),
+                                tuple_active_visible,
+                                tuple_xmin,
+                                tuple_xmax,
+                                tuple_infomask,
+                                tuple_infomask2,
+                            );
+                        }
                         values[i] =
                             pg_sys::Datum::from(pg_sys::pg_detoast_datum(values[i].cast_mut_ptr()));
                     }
