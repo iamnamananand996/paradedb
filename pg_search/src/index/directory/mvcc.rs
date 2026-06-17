@@ -57,6 +57,56 @@ use tantivy::{Directory, IndexMeta, SegmentMeta, TantivyError};
 /// which creates less lock contention than allocating one block at a time.
 pub const BUFWRITER_CAPACITY: usize = bm25_max_free_space() * MAX_BUFFERS_TO_EXTEND_BY;
 
+static TOAST_DIAG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TOAST_DIAG_DELAY_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TOAST_DIAG_LOG_LIMIT: OnceLock<usize> = OnceLock::new();
+static TOAST_DIAG_DELAY_LIMIT: OnceLock<usize> = OnceLock::new();
+static TOAST_DIAG_DELAY_US: OnceLock<u64> = OnceLock::new();
+static TOAST_DIAG_FORCE_UNPROTECTED: OnceLock<bool> = OnceLock::new();
+
+fn toast_diag_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn toast_diag_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn toast_diag_env_bool(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("on")
+            || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn toast_diag_should_log() -> bool {
+    let limit = *TOAST_DIAG_LOG_LIMIT
+        .get_or_init(|| toast_diag_env_usize("PG_SEARCH_TOAST_DIAG_LOG_LIMIT", 500));
+    limit > 0 && TOAST_DIAG_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < limit
+}
+
+fn toast_diag_delay_us() -> u64 {
+    *TOAST_DIAG_DELAY_US.get_or_init(|| toast_diag_env_u64("PG_SEARCH_TOAST_DIAG_DELAY_US", 0))
+}
+
+fn toast_diag_delay_limit() -> usize {
+    *TOAST_DIAG_DELAY_LIMIT
+        .get_or_init(|| toast_diag_env_usize("PG_SEARCH_TOAST_DIAG_DELAY_LIMIT", 0))
+}
+
+fn toast_diag_force_unprotected() -> bool {
+    *TOAST_DIAG_FORCE_UNPROTECTED
+        .get_or_init(|| toast_diag_env_bool("PG_SEARCH_TOAST_DIAG_FORCE_UNPROTECTED"))
+}
+
 /// Describes how a [`MvccDirectory`] should resolve segment visibility.  Note that
 /// this enum is purposely non-cloneable.  Wrap it with an [`Arc`] if you need that.  Because of
 /// the [`MvccSatisfies::ParallelWorker`] variant, cloning could be incredibly expensive when
@@ -813,7 +863,9 @@ pub fn index_memory_segment(
                     )
                 };
 
-                if !tuple_active_visible || htsv_result != HTSV_Result::HEAPTUPLE_LIVE {
+                if (!tuple_active_visible || htsv_result != HTSV_Result::HEAPTUPLE_LIVE)
+                    && toast_diag_should_log()
+                {
                     pgrx::warning!(
                         "pg_search toast diagnostic: SnapshotAny selected heap tuple before detoast index={} index_oid={} heap={} heap_oid={} segment={:?} requested_ctid={} tuple_ctid=({}, {}) htsv={} active_visible={} xmin={} xmax={} infomask=0x{:x} infomask2=0x{:x}",
                         indexrel.name(),
@@ -863,6 +915,10 @@ pub fn index_memory_segment(
                 );
             };
 
+            let suspicious_tuple =
+                !tuple_active_visible || tuple_htsv_result != HTSV_Result::HEAPTUPLE_LIVE;
+            let force_unprotected = suspicious_tuple && toast_diag_force_unprotected();
+
             // We have a completely valid tuple to index: fetch and deform it.
             //
             // NOTE: We intentionally pass `false` (don't materialize) to keep the
@@ -870,11 +926,32 @@ pub fn index_memory_segment(
             // VACUUM's LockBufferForCleanup, which prevents it from removing the
             // heap tuple and deleting its TOAST chunks while we read them below.
             // See: https://github.com/paradedb/paradedb/issues/5076
-            let htup = pg_sys::ExecFetchSlotHeapTuple(
-                heap_fetch_state.slot(),
-                false,
-                std::ptr::null_mut(),
-            );
+            //
+            // Diagnostic override: when PG_SEARCH_TOAST_DIAG_FORCE_UNPROTECTED=1,
+            // suspicious tuples are intentionally materialized. This releases the
+            // heap buffer pin before detoasting, recreating the unsafe window so
+            // Stressgres can prove whether stale TOAST pointers become invalid.
+            let mut should_free = false;
+            let htup = if force_unprotected {
+                if toast_diag_should_log() {
+                    pgrx::warning!(
+                        "pg_search toast diagnostic: forcing unprotected detoast window index={} index_oid={} heap={} heap_oid={} segment={:?} requested_ctid={} tuple_ctid=({}, {}) htsv={} active_visible={}",
+                        indexrel.name(),
+                        indexrel.oid(),
+                        heaprel.name(),
+                        heaprel.oid(),
+                        segment_meta.id(),
+                        ctid,
+                        tuple_blockno,
+                        tuple_offno,
+                        htsv_result_name(tuple_htsv_result),
+                        tuple_active_visible,
+                    );
+                }
+                pg_sys::ExecFetchSlotHeapTuple(heap_fetch_state.slot(), true, &mut should_free)
+            } else {
+                pg_sys::ExecFetchSlotHeapTuple(heap_fetch_state.slot(), false, std::ptr::null_mut())
+            };
 
             heap_deform_tuple(
                 htup,
@@ -888,12 +965,12 @@ pub fn index_memory_segment(
             // row_to_search_document can race with VACUUM deleting TOAST chunks
             // after we release the pin (the "missing chunk number 0" crash).
             // pg_detoast_datum is a no-op for already-inline / non-TOASTed data.
+            let mut delayed_tuple = false;
             for i in 0..heaptupdesc.len() {
                 if !isnull[i] {
                     let att = heaptupdesc.get(i).expect("valid attribute");
                     if att.attlen == -1 {
-                        if !tuple_active_visible || tuple_htsv_result != HTSV_Result::HEAPTUPLE_LIVE
-                        {
+                        if suspicious_tuple && toast_diag_should_log() {
                             pgrx::warning!(
                                 "pg_search toast diagnostic: about to detoast varlena index={} index_oid={} heap={} heap_oid={} segment={:?} requested_ctid={} tuple_ctid=({}, {}) attno={} attname={} htsv={} active_visible={} xmin={} xmax={} infomask=0x{:x} infomask2=0x{:x}",
                                 indexrel.name(),
@@ -914,6 +991,35 @@ pub fn index_memory_segment(
                                 tuple_infomask2,
                             );
                         }
+
+                        if suspicious_tuple && !delayed_tuple {
+                            let delay_us = toast_diag_delay_us();
+                            let delay_limit = toast_diag_delay_limit();
+                            if delay_us > 0 {
+                                let delay_number =
+                                    TOAST_DIAG_DELAY_COUNT.fetch_add(1, Ordering::Relaxed);
+                                if delay_number < delay_limit {
+                                    pgrx::warning!(
+                                        "pg_search toast diagnostic: delaying before detoast delay_us={} delay_number={} delay_limit={} force_unprotected={} index={} heap={} requested_ctid={} tuple_ctid=({}, {}) htsv={} active_visible={} attname={}",
+                                        delay_us,
+                                        delay_number + 1,
+                                        delay_limit,
+                                        force_unprotected,
+                                        indexrel.name(),
+                                        heaprel.name(),
+                                        ctid,
+                                        tuple_blockno,
+                                        tuple_offno,
+                                        htsv_result_name(tuple_htsv_result),
+                                        tuple_active_visible,
+                                        att.name(),
+                                    );
+                                    pg_sys::pg_usleep(delay_us as core::ffi::c_long);
+                                }
+                            }
+                            delayed_tuple = true;
+                        }
+
                         values[i] =
                             pg_sys::Datum::from(pg_sys::pg_detoast_datum(values[i].cast_mut_ptr()));
                     }
@@ -978,7 +1084,13 @@ pub fn index_memory_segment(
             // stay held until the next table_index_fetch_tuple call (which
             // replaces the slot contents) or until HeapFetchState is dropped at
             // end-of-query, unnecessarily blocking VACUUM on this buffer.
-            pg_sys::ExecClearTuple(heap_fetch_state.slot());
+            if force_unprotected {
+                if should_free {
+                    pg_sys::heap_freetuple(htup);
+                }
+            } else {
+                pg_sys::ExecClearTuple(heap_fetch_state.slot());
+            }
         }
     }
 
