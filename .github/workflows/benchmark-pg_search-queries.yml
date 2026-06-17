@@ -32,6 +32,14 @@ on:
         required: false
         type: boolean
         default: false
+      restore_dataset:
+        description: "Dataset to restore-check without running query benchmarks, e.g. stackoverflow or cohere_wikipedia."
+        required: false
+        default: ""
+      restore_sizes:
+        description: "Comma-separated size labels to restore-check with restore_dataset, e.g. 100k,1m or 1m,10m."
+        required: false
+        default: ""
 
 permissions:
   actions: write
@@ -57,7 +65,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'pull_request' &&
-        contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+        contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
       )
     env:
       pg_version: 18
@@ -74,14 +82,15 @@ jobs:
       - name: Maybe Remove Label
         if: >-
           github.event_name == 'pull_request' &&
-          contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+          contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr edit ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
             --remove-label benchmark \
-            --remove-label benchmark-queries || true
+            --remove-label benchmark-queries \
+            --remove-label benchmark-cohere || true
 
       - name: Determine Ref to Benchmark
         id: determine-ref
@@ -124,7 +133,9 @@ jobs:
       # always fetch the actions from main, unless we've explicitly overridden that, or triggered this via label (like you would on a PR)
       - name: Fetch the Latest Composite Actions
         if: >-
-          !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+          !inputs.use_benchmarks_from_ref &&
+          inputs.restore_dataset == '' &&
+          !contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
         uses: actions/checkout@v6
         with:
           repository: ${{ github.repository }}
@@ -135,18 +146,24 @@ jobs:
 
       - name: Copy latest actions into place
         if: >-
-          !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+          !inputs.use_benchmarks_from_ref &&
+          inputs.restore_dataset == '' &&
+          !contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
         run: cp -rv actions-temp/.github/actions .github/
 
       - name: Cleanup temporary checkout
         if: >-
-          !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+          !inputs.use_benchmarks_from_ref &&
+          inputs.restore_dataset == '' &&
+          !contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
         run: rm -rf actions-temp
 
       # always fetch the code from main, unless we've explicitly overridden that, or triggered this via label (like you would on a PR)
       - name: Fetch latest benchmark code, suites
         if: >-
-          !inputs.use_benchmarks_from_ref && !contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
+          !inputs.use_benchmarks_from_ref &&
+          inputs.restore_dataset == '' &&
+          !contains(fromJson('["benchmark", "benchmark-queries", "benchmark-cohere"]'), github.event.label.name)
         uses: ./.github/actions/benchmarks-from-main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -305,7 +322,10 @@ jobs:
       # runs queries against it.
       - name: Restore "stackoverflow" Heap Snapshot (100K)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         run: |
           set -euo pipefail
@@ -324,7 +344,10 @@ jobs:
 
       - name: Benchmark "stackoverflow" Dataset (100K)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         uses: ./.github/actions/benchmark-queries
         with:
@@ -339,7 +362,10 @@ jobs:
 
       - name: Restore "stackoverflow" Heap Snapshot (1M)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         run: |
           set -euo pipefail
@@ -358,7 +384,10 @@ jobs:
 
       - name: Benchmark "stackoverflow" Dataset (1M)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         uses: ./.github/actions/benchmark-queries
         with:
@@ -373,7 +402,10 @@ jobs:
 
       - name: Restore "stackoverflow" Heap Snapshot (20M)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         run: |
           set -euo pipefail
@@ -392,7 +424,10 @@ jobs:
 
       - name: Benchmark "stackoverflow" Dataset (20M)
         if: >-
-          github.event_name != 'pull_request' ||
+          (
+            github.event_name != 'pull_request' &&
+            inputs.restore_dataset == ''
+          ) ||
           contains(fromJson('["benchmark", "benchmark-queries"]'), github.event.label.name)
         uses: ./.github/actions/benchmark-queries
         with:
@@ -404,6 +439,61 @@ jobs:
           slack_channel: ${{ secrets.SLACK_BENCHMARKS_CHANNEL_ID }}
           pr_label: ${{ steps.pr_label.outputs.result }}
           fail_on_error: ${{ inputs.fail_on_error || true }}
+
+      - name: Restore Heap Snapshots
+        if: >-
+          inputs.restore_dataset != '' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.label.name == 'benchmark-cohere'
+          )
+        run: |
+          set -euo pipefail
+          dataset="${{ inputs.restore_dataset }}"
+          sizes="${{ inputs.restore_sizes }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.label.name }}" = "benchmark-cohere" ]; then
+            dataset="${dataset:-cohere_wikipedia}"
+            sizes="${sizes:-1m,10m}"
+          fi
+          if [ -z "${dataset}" ] || [ -z "${sizes}" ]; then
+            echo "restore_dataset and restore_sizes must both be set for restore-only runs."
+            exit 1
+          fi
+
+          root_table="$(DATASET="${dataset}" python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          dataset = os.environ["DATASET"]
+          config = tomllib.loads(Path(f"benchmarks/datasets/{dataset}/config.toml").read_text())
+          print(config["root_table"]["name"])
+          PY
+          )"
+
+          IFS=',' read -ra restore_sizes <<< "${sizes}"
+          for size in "${restore_sizes[@]}"; do
+            size="$(echo "${size}" | xargs)"
+            if [ -z "${size}" ]; then
+              continue
+            fi
+            echo "Restoring ${dataset} heap snapshot (${size})..."
+            (cd pg_search && cargo pgrx stop pg${{ env.pg_version }})
+            (cd benchmarks && cargo run --release -- restore-heap \
+              --dataset "${dataset}" \
+              --size "${size}" \
+              --pgdata "/home/runner/.pgrx/data-${{ env.pg_version }}" \
+              --stanza "${BACKREST_STANZA}" \
+              --repo-bucket "${BACKREST_REPO_BUCKET}" \
+              --repo-path-prefix "${BACKREST_REPO_PATH_PREFIX}" \
+              --repo-region "${BACKREST_REPO_REGION}" \
+              --repo-endpoint "${BACKREST_REPO_ENDPOINT}" \
+              --repo-s3-key-type "${BACKREST_REPO_S3_KEY_TYPE}")
+            (cd pg_search && cargo pgrx start pg${{ env.pg_version }})
+            rows="$(psql postgresql://localhost:288${{ env.pg_version }}/postgres -tAc "SELECT count(*) FROM \"${root_table}\";")"
+            echo "${dataset} ${size}: ${rows} rows in ${root_table}"
+            test "${rows}" -gt 0
+          done
 
       - name: Notify Slack on Failure (push only)
         if: failure() && github.event_name == 'push'

@@ -162,6 +162,43 @@ cargo run --release -- load-heap \
 
 `load-heap` reads from `{s3_base_path}/sampled/{size}/csv/{table}/`, creates tables from `datasets/{dataset}/create_tables.sql`, and bulk-loads CSV files. Use `--data-source` to override `s3_base_path` from the dataset config.
 
+### Cohere Wikipedia 1M/10M
+
+The Cohere Wikipedia dataset has a `source.toml` recipe that points at the Hugging Face parquet files used by `turbopuffer/tpuf-benchmark`. It preserves `_id`, `url`, `title`, `text`, and `emb`; `emb` is loaded into Postgres as `JSONB` until the query/index suite chooses the final vector representation.
+
+```bash
+cargo run --release -- prepare-dataset \
+  --dataset cohere_wikipedia \
+  --rows 1000000 \
+  --output s3://paradedb-benchmarks/datasets/cohere_wikipedia/sampled/1m/csv/
+
+cargo run --release -- prepare-dataset \
+  --dataset cohere_wikipedia \
+  --rows 10000000 \
+  --output s3://paradedb-benchmarks/datasets/cohere_wikipedia/sampled/10m/csv/
+```
+
+Then load and snapshot each size with the same heap flow. The snapshot example uses `PGDATA` and `BACKREST_ARGS` from the pgBackRest section below.
+
+```bash
+POSTGRES_URL="postgresql://localhost:28818/postgres"
+
+cargo run --release -- load-heap \
+  --url "${POSTGRES_URL}" \
+  --dataset cohere_wikipedia \
+  --size 1m
+
+(cd ../pg_search && cargo pgrx stop pg18)
+cargo run --release -- snapshot-heap \
+  --dataset cohere_wikipedia \
+  --size 1m \
+  --pgdata "${PGDATA}" \
+  "${BACKREST_ARGS[@]}"
+(cd ../pg_search && cargo pgrx start pg18)
+```
+
+The `benchmark-pg_search-queries` workflow can restore-check snapshots without running queries by setting `restore_dataset` and `restore_sizes` in `workflow_dispatch`. Applying the `benchmark-cohere` PR label restores the 1M and 10M Cohere snapshots.
+
 ## Step 6: Snapshot or Restore the Heap
 
 The snapshot commands shell out to `pgbackrest`, so install and configure pgBackRest before using them. Use `--config` to provide your own pgBackRest config, or pass repository settings to generate one. The examples below use ParadeDB's CI snapshot repository: `s3://paradedb-ci-benchmarks/snapshots/{dataset}/{size}/`.

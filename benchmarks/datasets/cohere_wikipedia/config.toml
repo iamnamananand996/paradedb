@@ -1,0 +1,7 @@
+sampling_seed = 723
+s3_base_path = "s3://paradedb-benchmarks/datasets/cohere_wikipedia"
+tables = []
+
+[root_table]
+name = "cohere_wikipedia"
+primary_key = "_id"

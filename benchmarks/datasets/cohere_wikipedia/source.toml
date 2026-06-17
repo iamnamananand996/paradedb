@@ -1,0 +1,35 @@
+kind = "parquet_sequence"
+table = "cohere_wikipedia"
+base_url = "https://huggingface.co/datasets/CohereLabs/wikipedia-2023-11-embed-multilingual-v3/resolve/main"
+url_query = "download=true"
+approx_rows_per_file = 100000
+extra_files = 2
+columns = ["_id", "url", "title", "text", "emb::VARCHAR AS emb"]
+
+[[sequences]]
+path = "en"
+file_count = 415
+
+[[sequences]]
+path = "de"
+file_count = 208
+
+[[sequences]]
+path = "fr"
+file_count = 179
+
+[[sequences]]
+path = "ru"
+file_count = 138
+
+[[sequences]]
+path = "es"
+file_count = 130
+
+[[sequences]]
+path = "it"
+file_count = 105
+
+[[sequences]]
+path = "ceb"
+file_count = 99

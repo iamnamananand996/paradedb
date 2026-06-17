@@ -28,6 +28,7 @@ use std::time::Instant;
 mod backrest;
 mod config;
 mod convert;
+mod prepare;
 mod sample;
 mod utils;
 
@@ -44,6 +45,8 @@ enum Commands {
     Benchmark(BenchmarkArgs),
     /// Convert parquet datasets in S3 to CSV format using DuckDB.
     Convert(convert::ConvertArgs),
+    /// Prepare a dataset's CSV data from its source recipe.
+    PrepareDataset(prepare::PrepareDataset),
     /// Sample a CSV dataset to a target row count, preserving table relationships.
     Sample(sample::SampleArgs),
     /// Load a dataset's heap without building the index or running queries, so the resulting
@@ -125,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         // run_sql_benchmarks, gated on `--skip-index`.
         Commands::Benchmark(args) => run_sql_benchmarks(&args).await,
         Commands::Convert(args) => convert::run_convert(args),
+        Commands::PrepareDataset(args) => args.prepare(),
         Commands::Sample(args) => sample::run_sample(args),
         // Load the heap without building the index or running queries, leaving a heap-only cluster
         // ready to be captured as a snapshot. The benchmark job rebuilds the index after restore.
