@@ -265,7 +265,20 @@ WHERE f.content @@@ 'Section'
   AND length(f.title) > 0
 ORDER BY f.title, p.size_bytes
 LIMIT 10;
-ERROR:  An expression context must be provided when heap filtering.
+  title  | size_bytes 
+---------+------------
+ file-1  |        616
+ file-1  |       1312
+ file-1  |       2008
+ file-1  |       2704
+ file-1  |       3400
+ file-10 |        153
+ file-10 |       1465
+ file-10 |       2161
+ file-10 |       2857
+ file-10 |       3553
+(10 rows)
+
 -- =====================================================================
 -- Cleanup
 -- =====================================================================
