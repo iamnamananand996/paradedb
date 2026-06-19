@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         // run_sql_benchmarks, gated on `--skip-index`.
         Commands::Benchmark(args) => run_sql_benchmarks(&args).await,
         Commands::Convert(args) => convert::run_convert(args),
-        Commands::Sample(args) => sample::run_sample(args),
+        Commands::Sample(args) => args.run(),
         // Load the heap without building the index or running queries, leaving a heap-only cluster
         // ready to be captured as a snapshot. The benchmark job rebuilds the index after restore.
         Commands::LoadHeap(args) => load_external_data(
